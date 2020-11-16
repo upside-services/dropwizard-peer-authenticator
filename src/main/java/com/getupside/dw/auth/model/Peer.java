@@ -1,4 +1,4 @@
-package com.washingtonpost.dw.auth.model;
+package com.getupside.dw.auth.model;
 
 import java.util.Objects;
 import java.security.Principal;

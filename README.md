@@ -1,57 +1,89 @@
-# dropwizard-peer-authenticator
-Dropwizard module to enable BasicAuth security around a service with convenience factories for reading in lists of (users, passwords) who are authorized to make requests of your service.
+# dropwizard-peer-authenticator-aws-sm
+Dropwizard module to enable BasicAuth security around a service with convenience factories for loading one or more maps of authorized users and their passwords from AWS Secrets Manager.
 
-This artifact provides a Dropwizard Configuration/Factory class that enables convenient registration of an authorization filter with a Dropwizard Jersey Server.  This artifact is essentially a configuration wrapper around the documentation provided at http://www.dropwizard.io/0.9.2/docs/manual/auth.html
+This artifact provides a Dropwizard Configuration/Factory class that enables convenient registration of an authorization filter with a Dropwizard Jersey Server.  This artifact is essentially a configuration wrapper around the documentation provided at https://www.dropwizard.io/en/latest/manual/auth.html#basic-authentication
 
 A "Peer" object is a (username, password) POJO that models a remote service or user invoking some endpoint in your Dropwizard service.  The AllowedPeerAuthenticator loads a list of allowed peers from some source and then registers itself with Jersey to provide endpoint-level authentication on top of HTTP BasicAuth.  Because this is just a BasicAuth authenticator, your DW service should only be accessed over HTTPS.
 
-## Maven dependency
+## AWS Secrets Manager
+
+Secrets Manager is a hosted service within AWS that allows you to store a map of secrets at a "coordinate" (aka "secret id").
+Secrets can be isolated into different coordinates and selectively granted read access to different users based on the principle of least privilege. 
+For example, assume your web app has a generic 'web' user that can do all PUT, POST, GET operations and also a special 'admin' user who is allowed to invoke DELETE endpoints.
+
+You may isolate access to the 'web' user from access to the 'admin' user by storing those users in different secret coordinates with different IAM access policies for each secret:
+
+* AWS Secrets Manager coordinate "services/prod/my_webapp/basic_auth/web" 
+  holds secret `{ "web": "password!" }`
+* AWS Secrets Manager coordinate "services/prod/my_webapp/basic_auth/admin"  
+  holds secret `{ "admin": "supersecret!" }`
+  
+The IAM policy for the "web" user may restrict access to _just_ that coordinate:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+          "Sid": "VisualEditor0",
+          "Effect": "Allow",
+          "Action": "secretsmanager:DescribeSecret",
+          "Resource": "arn:aws:secretsmanager:us-east-1:1234567890:secret:services/prod/my_webapp/basic_auth/web"
+      },
+      {
+          "Sid": "VisualEditor1",
+          "Effect": "Allow",
+          "Action": "secretsmanager:GetSecretValue",
+          "Resource": "arn:aws:secretsmanager:us-east-1:1234567890:secret:services/prod/my_webapp/basic_auth/web"
+      }
+    ]
+  }
+```
+
+Your Dropwizard service that allows either the `web` or the `admin` user to authenticate will need a policy that allows access to both coordinates, and this plugin provides the functionality to load multiple coordinates into a "soup" of authorized users with all (key, value) pairs from all enumerated coordinates combining together into the Authenticator.
+
+## Integration Steps
+
+### 1. Add a dependency 
+
 Check [./RELEASE_NOTES.md](./RELEASE_NOTES.md) for the latest/best version for your needs, and add this to your pom:
 ```
 <dependency>
-    <groupId>com.washingtonpost.dropwizard</groupId>
-    <artifactId>dropwizard-peer-authenticator</artifactId>
-    <version>2.1.0-SNAPSHOT</version>
+    <groupId>com.getupside.dropwizard</groupId>
+    <artifactId>dropwizard-peer-authenticator-aws-sm</artifactId>
+    <version>2.0.0</version>
 </dependency>
 ```
 
-In general, the 1.x.y versions are compatible with Dropwizard-0.8-X while the 2.x.y versions are compatible with Dropwizard-0.9.X
+### 2. Update app config
+In your app_config.yml, add a new stanza like:
 
-## Example configuration : peer file
-
-Add a file like "allowed-peers.properties" to your classpath with a list of users and passwords that should be allowed to invoke endpoints on your service.  For example:
 ```yaml
-alice=abc123
-bob=supersecret
-```
-
-In your application configuration YAML, add the configuration:
-```
-allowedPeers: 
-    credentialFile: allowed-peers.properties
+allowedPeers:
+  secretCoordinates: ${AWS_SECRET_MANAGER_BASIC_AUTH}
 ```
 
 In your application's Configuration class, add the AllowedPeerConfiguration object like:
 ```java
 
 import io.dropwizard.Configuration;
-import com.washingtonpost.dw.auth.AllowedPeerConfiguration;
+import com.getupside.dw.auth.AllowedPeerConfiguration;
 
 public class MyAppConfiguration extends Configuration {
 
+    @JsonProperty("allowedPeers")
     private AllowedPeerConfiguration allowedPeers = new AllowedPeerConfiguration();
 
-    @JsonProperty("allowedPeers")
-    public AllowedPeerConfiguration getAllowedPeers() {
-        return this.allowedPeers;
-    }
-
-    @JsonProperty("allowedPeers")
     public void setAllowedPeers(AllowedPeerConfiguration allowedPeers) {
         this.allowedPeers = allowedPeers;
     }
+
+    public AwsConfiguration getAwsConfiguration() {
+        return awsConfiguration;
+    }
 ```
 
+### 3. Register the Authenticator
 In your main application class, register the authenticator with jersey:
 ```java 
 public class MyApplication extends Application<MyConfiguration> {
@@ -61,11 +93,13 @@ public class MyApplication extends Application<MyConfiguration> {
         configuration.getAllowedPeers().registerAuthenticator(environment);
 ```
 
-Finally, protect whatever resource endpoints you need with the Dropwizard @Auth annotation, like so:
+### 4. Protect your Resources
+
+Protect whatever resource endpoints you need with the Dropwizard @Auth annotation, like so:
 
 ```java
 import io.dropwizard.auth.Auth;
-import com.washingtonpost.dw.auth.model.Peer;
+import com.getupside.dw.auth.model.Peer;
 
 @Path("/api/stuff")
 @Produces(MediaType.APPLICATION_JSON)
@@ -77,87 +111,37 @@ public class MyResource {
     }
 ```
 
-The @Auth annotation will be hooked up to the AllowedPeerAuthenticator and will check every request to getStuff() to see if there's a BasicAuth header that authenticates against the passwords defined for users bob and alice in the provided allowed-peers.properties.
+The @Auth annotation will be automatically hooked up to the AllowedPeerAuthenticator and will check every request to `getStuff()` to see if there's a BasicAuth header that authenticates against any of the (user, password) values loaded from the AWS Secrets Manager coordinates specified in the `$AWS_SECRET_MANAGER_BASIC_AUTH` environment variable.
 
-## Example configuration : plain strings
+### 5. Run your Service
 
-Some application deployment environments don't lend themselves to easily (d)encrypted properties files so an additional configuration option allows you to instead just provide a single string containing a list of usernames and a corresponding string containing passwords for those users, for example:
-```yaml
-allowedPeers: 
-    users: alice;bob
-    passwords: abc123;supersecret
+When you run your Dropwizard service, be sure to run it with these environment variables:
+
+```json
+export AWS_SECRET_MANAGER_BASIC_AUTH="comma/separated/list, of/secrets/manager/coordinates, you/want/your/service/to/load"
+export AWS_ACCESS_KEY_ID=< some IAM user/role with read access to the secret coordinate(s) >
+export AWS_SECRET_ACCESS_KEY=< secret to go with the access key >
+export AWS_REGION=< the region in which the secrets are stored >
 ```
 
-Note that the default delimiter of ";" can be over-riden with the delimiter property like:
+_Note_: this plugin leverages the AWS [DefaultAWSCredentialsProviderChain](https://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/auth/DefaultAWSCredentialsProviderChain.html) and [DefaultAwsRegionProviderChain](https://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/regions/DefaultAwsRegionProviderChain.html) to source the IAM authorization and AWS Region values, so consult their documentation for precise search order if you experience issues with environment variables vs. system variables, etc.
 
-```yaml
-allowedPeers: 
-    users: alice/bob
-    passwords: abc123/supersecret
-    delimiter: /
-```
+## Test Support
 
-If you use this configuration option, you must provide an equal number of usernames in the "users" string as you provide passwords in the "passwords" string, and you must provide both properties.
+Because you may not want everything that compiles your service to need full AWS Secrets Manager access, this authenticator supports classpath-accessible mocks.
 
-## Caching
-
-As mentioned in http://www.dropwizard.io/0.9.2/docs/manual/auth.html, caching may be an important concern if the backing stores for the authenticators is not capable of high throughput (this isn't really a concern for our flat file or strings, but caching support is provided for future extensibility).  If you provide a "cachePolicy" configuration option, the Authenticator that is registered with Jersey will be of the type CachingAuthenticator.  For example:
-
-```yaml
-allowedPeers: 
-    credentialFile: allowed-peers.properties
-    cachePolicy: maximumSize=100, expireAfterAccess=10m
-```
-
-## Realm name
-
-BasicAuth challenges require a "realm" name which as far as I can tell isn't that important from a functional standpoint, so it defaults to "peers" but is configurable with the "realm" property like:
-```yaml
-allowedPeers: 
-    credentialFile: allowed-peers.properties
-    cachePolicy: maximumSize=100, expireAfterAccess=10m
-    realm: SUPER SECRET STUFF
-```
-
-
-## Encrypting Passwords
-
-To avoid plain-text passwords in your allowed-peers.properties file, this module enables you to specify a simple {"NONE", "BASIC" or "STRONG"} encryption policy on the supplied passwords which correspond to none, Basic or Strong PasswordEncryptors from the excellent http://www.jasypt.org/ project.  For value "NONE" it's assumed the allowed-peers.properties contains plaintext passwords and requests to the running service have unencrypted passwords in their BasicAuth header.  If a "BASIC" or "STRONG" encryptor configuration is provided, then it's assumed the passwords in allowed-peers.properties are encrypted with the Jasypt PasswordEncryptor and that the BasicAuth passwords are _unencrypted_ but will be encrypted using the same encryptor before being compared against the encrypted allowed-peers.properties value.
-
-For example, to enable encrypting of the passwords in your allowed-peers.properties file with Jasypt's BasicPasswordEncryptor, add this configuration to your Dropwizard YAML configuration file:
-
-```yaml
+For example, if your app_config.yml specifies:
+```json
 allowedPeers:
-    credentialFile: allowed-peers.properties
-    encryptor: BASIC
+  secretCoordinates: ${AWS_SECRET_MANAGER_BASIC_AUTH:-"mock:/test-peers.json"}
 ```
 
-Then encrypt the password in your `allowed-peers.properties` files using a `main` class shipped in this JAR:
-```
-git clone git@github.com:washingtonpost/dropwizard-peer-authenticator.git
-mvn clean install -Pexecutable-jar
+Then by _not_ exporting a `AWS_SECRET_MANAGER_BASIC_AUTH` environment variable, the Authenticator will bootup and load the (key, value) pairs found at a classpath resource "test-peers.json" and will use all values found there as authenticated peers
 
-java -cp target/dropwizard-peer-authenticator-*-SNAPSHOT.jar com.washingtonpost.dw.auth.encryptor.JasyptEncryptor -type BASIC -password
-The secret to encrypt: <mySecret>
-ENC(LrAsd3MBh/grqOMIMdtO1UQ0Mavz+U1s)
-
-## or, for stronger/slightly slower security use the "STRONG" type
-## just make sure your YAML file declares the same allowedPeers.encryptor type as you used when encrypting your passwords
-java -cp target/dropwizard-peer-authenticator-*-SNAPSHOT.jar com.washingtonpost.dw.auth.encryptor.JasyptEncryptor -type STRONG -password
-The secret to encrypt: <mySecret>
-ENC(1XuMDHrI3yxbX5dMngRMn6n2RUD3XiAjr1hRdlkLzsBUWaVifl9GBd6q/cokEUt6)
-```
-
-Use the encrypted password in your allowed-peers.properties file, e.g.:
-
-```yaml
-alice=ENC(LrAsd3MBh/grqOMIMdtO1UQ0Mavz+U1s)
-```
-
-Then any BasicAuth requests made against a service protected with this allowed-peers module should pass "alice:mySecret" as the username and password which will authenticate against the encrypted, in-memory "alice:LrAsd3MBh/grqOMIMdtO1UQ0Mavz+U1s" value.
-
-
-# TODO/Notes
-
-* add checkstyle & better maven site generation
-* support Chained Factories?
+Example "test-peers.json":
+```json
+{
+  "mock_user": "some_secret",
+  "another_user": "another_secret"
+}
+``` 

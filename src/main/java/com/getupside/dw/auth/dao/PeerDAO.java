@@ -1,6 +1,7 @@
-package com.washingtonpost.dw.auth.dao;
+package com.getupside.dw.auth.dao;
 
-import com.washingtonpost.dw.auth.model.Peer;
+import com.getupside.dw.auth.model.Peer;
+
 import java.util.Set;
 
 /**
